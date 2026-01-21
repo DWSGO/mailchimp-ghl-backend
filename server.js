@@ -22,7 +22,6 @@ function requireEnv(name, value) {
 }
 
 function parseTags(input) {
-  // Accept: ["a","b"] OR "a,b" OR "a" OR undefined
   if (!input) return [];
   if (Array.isArray(input)) {
     return input.map(String).map((s) => s.trim()).filter(Boolean);
@@ -33,12 +32,11 @@ function parseTags(input) {
 }
 
 function filterAllowedTags(tags) {
-  if (ALLOWED_TAGS.length === 0) return tags; // no restriction
+  if (ALLOWED_TAGS.length === 0) return tags;
   return tags.filter((t) => ALLOWED_TAGS.includes(String(t).toLowerCase()));
 }
 
 async function mailchimpFetch(url, { method, body }) {
-  // Mailchimp Basic auth: anyuser:apikey
   const auth = Buffer.from(`anystring:${MAILCHIMP_API_KEY}`).toString("base64");
 
   const resp = await fetch(url, {
@@ -64,6 +62,11 @@ async function mailchimpFetch(url, { method, body }) {
 // Health check
 app.get("/", (req, res) => res.status(200).send("OK - Mailchimp X GHL backend running"));
 
+// DEBUG: Echo whatever GHL sends
+app.post("/debug/echo", (req, res) => {
+  return res.json({ received: req.body });
+});
+
 app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
   try {
     requireEnv("MAILCHIMP_API_KEY", MAILCHIMP_API_KEY);
@@ -74,6 +77,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
     // Support multiple key styles coming from GHL
     const email = body.email || body.Email || body.contact?.email;
+
     const firstName =
       body.firstName ||
       body.FNAME ||
@@ -81,6 +85,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       body.contact?.first_name ||
       body.contact?.firstName ||
       "";
+
     const lastName =
       body.lastName ||
       body.LNAME ||
@@ -88,28 +93,32 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       body.contact?.last_name ||
       body.contact?.lastName ||
       "";
-    const rawTags = body.tags ?? body.tag ?? body.contact?.tags ?? "";
+
+    // IMPORTANT: only take tags from what your workflow sends
+    // (prevents "all contact tags" from being pushed)
+    const rawTags = body.tags ?? body.tag ?? "";
 
     if (!email) return res.status(400).json({ error: "email is required" });
 
-    const subscriberHash = crypto
-      .createHash("md5")
-      .update(String(email).toLowerCase())
-      .digest("hex");
+    const cleanEmail = String(email).trim().toLowerCase();
+
+    const subscriberHash = crypto.createHash("md5").update(cleanEmail).digest("hex");
 
     // 1) Upsert member (merge fields)
     const upsertUrl = `https://${MAILCHIMP_DC}.api.mailchimp.com/3.0/lists/${MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}`;
 
+    const upsertPayload = {
+      email_address: cleanEmail,
+      status_if_new: "subscribed",
+      merge_fields: {
+        FNAME: String(firstName || ""),
+        LNAME: String(lastName || ""),
+      },
+    };
+
     const upsert = await mailchimpFetch(upsertUrl, {
       method: "PUT",
-      body: {
-        email_address: String(email),
-        status_if_new: "subscribed",
-        merge_fields: {
-          FNAME: String(firstName || ""),
-          LNAME: String(lastName || ""),
-        },
-      },
+      body: upsertPayload,
     });
 
     if (!upsert.ok) {
@@ -117,6 +126,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
         error: "Mailchimp upsert failed",
         status: upsert.status,
         details: upsert.json || upsert.text,
+        sent: upsertPayload,
       });
     }
 
@@ -139,11 +149,17 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
           error: "Mailchimp tag apply failed",
           status: tagResp.status,
           details: tagResp.json || tagResp.text,
+          appliedTags: tagList,
         });
       }
     }
 
-    return res.json({ success: true, appliedTags: tagList });
+    // Return what we received so you can confirm in GHL execution logs
+    return res.json({
+      success: true,
+      received: { email: cleanEmail, firstName, lastName, rawTags },
+      appliedTags: tagList,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error", details: String(e?.message || e) });
