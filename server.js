@@ -7,18 +7,41 @@ app.use(express.json({ limit: "1mb" }));
 
 const MAILCHIMP_API_KEY = process.env.MAILCHIMP_API_KEY || "";
 const MAILCHIMP_AUDIENCE_ID = process.env.MAILCHIMP_AUDIENCE_ID || "";
-const MAILCHIMP_DC = process.env.MAILCHIMP_DC || ""; // e.g. us21
+const MAILCHIMP_DC = process.env.MAILCHIMP_DC || ""; // e.g. us18
 const PORT = Number(process.env.PORT || 8080);
 
 // Health check
-app.get("/", (req, res) => {
-  res.status(200).send("OK - Mailchimp X GHL backend running");
-});
+app.get("/", (req, res) => res.status(200).send("OK - Mailchimp X GHL backend running"));
+
+function md5SubscriberHash(email) {
+  return crypto
+    .createHash("md5")
+    .update(String(email).trim().toLowerCase())
+    .digest("hex");
+}
+
+function parseTags(tags) {
+  // Accept: ["a","b"] OR "a,b" OR "a"
+  let list = [];
+  if (Array.isArray(tags)) list = tags;
+  else if (typeof tags === "string") {
+    list = tags.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  // unique + max safety trimming
+  return Array.from(new Set(list.map((t) => String(t).trim()).filter(Boolean)));
+}
 
 // GHL -> Mailchimp webhook
 app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
   try {
-    const { email, firstName, lastName, tags } = req.body || {};
+    const body = req.body || {};
+
+    // ✅ Support both styles if you ever accidentally send FNAME/LNAME
+    const email = body.email;
+    const firstName = body.firstName ?? body.FNAME ?? "";
+    const lastName = body.lastName ?? body.LNAME ?? "";
+    const tags = body.tags;
+
     if (!email) return res.status(400).json({ error: "email is required" });
 
     if (!MAILCHIMP_API_KEY || !MAILCHIMP_AUDIENCE_ID || !MAILCHIMP_DC) {
@@ -28,13 +51,9 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       });
     }
 
-    // Mailchimp identifies contacts by MD5(email_lowercase)
-    const subscriberHash = crypto
-      .createHash("md5")
-      .update(String(email).toLowerCase())
-      .digest("hex");
+    const subscriberHash = md5SubscriberHash(email);
 
-    // 1) Upsert member
+    // 1) Upsert member (create/update)
     const upsertResp = await fetch(
       `https://${MAILCHIMP_DC}.api.mailchimp.com/3.0/lists/${MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}`,
       {
@@ -47,8 +66,8 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
           email_address: email,
           status_if_new: "subscribed",
           merge_fields: {
-            FNAME: firstName || "",
-            LNAME: lastName || "",
+            FNAME: String(firstName || ""),
+            LNAME: String(lastName || ""),
           },
         }),
       }
@@ -56,15 +75,11 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
     if (!upsertResp.ok) {
       const txt = await upsertResp.text();
-      return res
-        .status(400)
-        .json({ error: "Mailchimp upsert failed", details: txt });
+      return res.status(400).json({ error: "Mailchimp upsert failed", details: txt });
     }
 
-    // 2) Add tags (if provided)
-    const tagList = Array.isArray(tags)
-      ? tags.filter(Boolean).map(String)
-      : [];
+    // 2) Apply tags (you want only newsletter — send "newsletter" from GHL)
+    const tagList = parseTags(tags);
 
     if (tagList.length > 0) {
       const tagResp = await fetch(
@@ -83,20 +98,17 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
       if (!tagResp.ok) {
         const txt = await tagResp.text();
-        return res
-          .status(400)
-          .json({ error: "Mailchimp tag apply failed", details: txt });
+        return res.status(400).json({ error: "Mailchimp tag apply failed", details: txt });
       }
     }
 
-    return res.json({ success: true });
+    return res.json({ success: true, appliedTags: tagList });
   } catch (e) {
-    console.error("Webhook error:", e);
+    console.error(e);
     return res.status(500).json({ error: "Server error" });
   }
 });
 
-// ✅ THIS WAS MISSING — keeps server running
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
 });
