@@ -10,40 +10,37 @@ const MAILCHIMP_AUDIENCE_ID = process.env.MAILCHIMP_AUDIENCE_ID || "";
 const MAILCHIMP_DC = process.env.MAILCHIMP_DC || ""; // e.g. us18
 const PORT = Number(process.env.PORT || 8080);
 
-// Health check
-app.get("/", (req, res) => res.status(200).send("OK - Mailchimp X GHL backend running"));
-
-function md5SubscriberHash(email) {
-  return crypto
-    .createHash("md5")
-    .update(String(email).trim().toLowerCase())
-    .digest("hex");
+function normalizeEmail(v) {
+  return String(v || "").trim().toLowerCase();
 }
 
-function parseTags(tags) {
-  // Accept: ["a","b"] OR "a,b" OR "a"
-  let list = [];
-  if (Array.isArray(tags)) list = tags;
-  else if (typeof tags === "string") {
-    list = tags.split(",").map((t) => t.trim()).filter(Boolean);
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
   }
-  // unique + max safety trimming
-  return Array.from(new Set(list.map((t) => String(t).trim()).filter(Boolean)));
+  return "";
 }
 
-// GHL -> Mailchimp webhook
+// Accept tags as: ["newsletter"] OR "newsletter" OR "newsletter, GHL"
+function normalizeTags(input) {
+  if (Array.isArray(input)) {
+    return input.map((t) => String(t).trim()).filter(Boolean);
+  }
+  if (typeof input === "string") {
+    return input
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+app.get("/", (req, res) => {
+  res.status(200).send("OK - Mailchimp X GHL backend running");
+});
+
 app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
   try {
-    const body = req.body || {};
-
-    // ✅ Support both styles if you ever accidentally send FNAME/LNAME
-    const email = body.email;
-    const firstName = body.firstName ?? body.FNAME ?? "";
-    const lastName = body.lastName ?? body.LNAME ?? "";
-    const tags = body.tags;
-
-    if (!email) return res.status(400).json({ error: "email is required" });
-
     if (!MAILCHIMP_API_KEY || !MAILCHIMP_AUDIENCE_ID || !MAILCHIMP_DC) {
       return res.status(500).json({
         error:
@@ -51,9 +48,22 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       });
     }
 
-    const subscriberHash = md5SubscriberHash(email);
+    // ✅ Support multiple field names coming from GHL
+    const body = req.body || {};
+    const email = normalizeEmail(body.email || body.Email || body.contact_email);
 
-    // 1) Upsert member (create/update)
+    // These two lines fix your issue (supports both naming styles)
+    const firstName = pickFirst(body.firstName, body.firstname, body.FNAME, body.fname);
+    const lastName = pickFirst(body.lastName, body.lastname, body.LNAME, body.lname);
+
+    // ✅ Support both tags / tag, and string/array
+    const tags = normalizeTags(body.tags ?? body.tag);
+
+    if (!email) return res.status(400).json({ error: "email is required" });
+
+    const subscriberHash = crypto.createHash("md5").update(email).digest("hex");
+
+    // 1) Upsert member
     const upsertResp = await fetch(
       `https://${MAILCHIMP_DC}.api.mailchimp.com/3.0/lists/${MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}`,
       {
@@ -65,9 +75,10 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
         body: JSON.stringify({
           email_address: email,
           status_if_new: "subscribed",
+          // Mailchimp merge fields must be FNAME/LNAME
           merge_fields: {
-            FNAME: String(firstName || ""),
-            LNAME: String(lastName || ""),
+            FNAME: firstName || "",
+            LNAME: lastName || "",
           },
         }),
       }
@@ -78,10 +89,8 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       return res.status(400).json({ error: "Mailchimp upsert failed", details: txt });
     }
 
-    // 2) Apply tags (you want only newsletter — send "newsletter" from GHL)
-    const tagList = parseTags(tags);
-
-    if (tagList.length > 0) {
+    // 2) Apply tags (optional)
+    if (tags.length > 0) {
       const tagResp = await fetch(
         `https://${MAILCHIMP_DC}.api.mailchimp.com/3.0/lists/${MAILCHIMP_AUDIENCE_ID}/members/${subscriberHash}/tags`,
         {
@@ -91,7 +100,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            tags: tagList.map((t) => ({ name: t, status: "active" })),
+            tags: tags.map((t) => ({ name: String(t), status: "active" })),
           }),
         }
       );
@@ -102,7 +111,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
       }
     }
 
-    return res.json({ success: true, appliedTags: tagList });
+    return res.json({ success: true, email, firstName, lastName, tags });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
