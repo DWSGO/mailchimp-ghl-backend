@@ -22,14 +22,12 @@ function requireEnv(name, value) {
 }
 
 function parseTags(input) {
-  // Accept: ["a","b"] OR "a,b" OR "a" OR undefined
   if (!input) return [];
-  if (Array.isArray(input)) {
-    return input.map(String).map((s) => s.trim()).filter(Boolean);
-  }
-  const s = String(input).trim();
-  if (!s) return [];
-  return s.split(",").map((t) => t.trim()).filter(Boolean);
+  if (Array.isArray(input)) return input.map(String).map(s => s.trim()).filter(Boolean);
+  return String(input)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
 }
 
 function filterAllowedTags(tags) {
@@ -50,12 +48,9 @@ async function mailchimpFetch(url, { method, body }) {
   });
 
   const text = await resp.text();
-  let json;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
-  }
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+
   return { ok: resp.ok, status: resp.status, text, json };
 }
 
@@ -63,6 +58,43 @@ async function mailchimpFetch(url, { method, body }) {
 app.get("/", (req, res) =>
   res.status(200).send("OK - Mailchimp X GHL backend running")
 );
+
+// DEBUG: shows exactly what GHL is sending
+app.post("/debug/echo", (req, res) => {
+  return res.json({
+    received: req.body,
+    keys: Object.keys(req.body || {}),
+  });
+});
+
+function pickFirstName(body) {
+  // GHL standard payload usually uses first_name / last_name (snake_case)
+  return (
+    body.first_name ||
+    body.firstName ||
+    body.FNAME ||
+    body.fname ||
+    body.contact?.first_name ||
+    body.contact?.firstName ||
+    ""
+  );
+}
+
+function pickLastName(body) {
+  return (
+    body.last_name ||
+    body.lastName ||
+    body.LNAME ||
+    body.lname ||
+    body.contact?.last_name ||
+    body.contact?.lastName ||
+    ""
+  );
+}
+
+function pickEmail(body) {
+  return body.email || body.Email || body.contact?.email || "";
+}
 
 app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
   try {
@@ -72,38 +104,28 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
     const body = req.body || {};
 
-    // ✅ Support GHL Webhook Action Data Format Guide (root fields)
-    const email =
-      body.email ||
-      body.Email ||
-      body.contact?.email;
+    const email = pickEmail(body);
+    if (!email) return res.status(400).json({ error: "email is required" });
 
-    const firstName =
-      body.first_name ||                 // ✅ doc format
-      body.firstName ||
-      body.FNAME ||
-      body.fname ||
-      body.contact?.first_name ||
-      body.contact?.firstName ||
-      "";
-
-    const lastName =
-      body.last_name ||                  // ✅ doc format
-      body.lastName ||
-      body.LNAME ||
-      body.lname ||
-      body.contact?.last_name ||
-      body.contact?.lastName ||
-      "";
-
-    // ✅ tags per doc can be "tags" at root (array)
+    // Prefer custom keys you control (apply_tags) instead of GHL standard tags
+    // so you don’t accidentally apply all contact tags.
     const rawTags =
-      body.tags ??                       // could be array or string
+      body.apply_tags ??
+      body.applyTags ??
+      body.tags ??
       body.tag ??
       body.contact?.tags ??
       "";
 
-    if (!email) return res.status(400).json({ error: "email is required" });
+    let firstName = String(pickFirstName(body) || "").trim();
+    let lastName = String(pickLastName(body) || "").trim();
+
+    // If names are missing but full_name exists, try splitting
+    if ((!firstName || !lastName) && body.full_name) {
+      const parts = String(body.full_name).trim().split(/\s+/);
+      if (!firstName && parts.length) firstName = parts[0];
+      if (!lastName && parts.length > 1) lastName = parts.slice(1).join(" ");
+    }
 
     const subscriberHash = crypto
       .createHash("md5")
@@ -119,8 +141,8 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
         email_address: String(email),
         status_if_new: "subscribed",
         merge_fields: {
-          FNAME: String(firstName || ""),
-          LNAME: String(lastName || ""),
+          FNAME: firstName,
+          LNAME: lastName,
         },
       },
     });
@@ -142,9 +164,7 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
       const tagResp = await mailchimpFetch(tagUrl, {
         method: "POST",
-        body: {
-          tags: tagList.map((t) => ({ name: String(t), status: "active" })),
-        },
+        body: { tags: tagList.map((t) => ({ name: String(t), status: "active" })) },
       });
 
       if (!tagResp.ok) {
@@ -158,17 +178,17 @@ app.post("/webhooks/ghl-to-mailchimp", async (req, res) => {
 
     return res.json({
       success: true,
-      received: { email, firstName, lastName, rawTags },
+      email,
+      firstName,
+      lastName,
       appliedTags: tagList,
     });
   } catch (e) {
     console.error(e);
-    return res
-      .status(500)
-      .json({ error: "Server error", details: String(e?.message || e) });
+    return res.status(500).json({ error: "Server error", details: String(e?.message || e) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Server running on http://localhost:${PORT}`);
 });
